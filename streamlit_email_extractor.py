@@ -66,7 +66,10 @@ BASE64_CANDIDATE_REGEX = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
 CF_EMAIL_REGEX = re.compile(r'data-cfemail="([a-f0-9]+)"')
 
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; EmailExtractor/1.0)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
 
@@ -239,11 +242,15 @@ def crawl(start_domain, max_pages, delay, use_ocr, progress_callback=None):
         visited.add(url)
 
         try:
-            resp = session.get(url, timeout=10)
-        except requests.RequestException:
+            resp = session.get(url, timeout=15)
+        except requests.RequestException as e:
             if progress_callback:
-                progress_callback(len(visited), max_pages, url, skipped=True)
+                progress_callback(len(visited), max_pages, url, skipped=True, error=str(e))
             continue
+
+        if resp.status_code != 200 and progress_callback:
+            progress_callback(len(visited), max_pages, url, skipped=True,
+                               error=f"HTTP {resp.status_code}")
 
         if resp.status_code == 200 and "text/html" in resp.headers.get("Content-Type", ""):
             try:
@@ -311,10 +318,12 @@ if start and domain_input:
     log_box = st.expander("Crawl log", expanded=False)
     log_lines = []
 
-    def progress_callback(count, total, url, skipped):
+    def progress_callback(count, total, url, skipped, error=None):
         progress_bar.progress(min(count / total, 1.0))
         status_box.text(f"Crawled {count}/{total} pages... currently: {url}")
-        log_lines.append(f"{'[skip]' if skipped else '[ok]  '} {url}")
+        tag = "[skip]" if skipped else "[ok]  "
+        reason = f" -- {error}" if error else ""
+        log_lines.append(f"{tag} {url}{reason}")
         log_box.text("\n".join(log_lines[-200:]))
 
     with st.spinner("Crawling..."):
