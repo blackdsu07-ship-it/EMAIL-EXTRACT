@@ -50,6 +50,15 @@ from collections import deque
 from urllib.parse import parse_qsl, unquote, urldefrag, urlencode, urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 
+import socket
+
+# Hard global cap on every blocking network / DNS call. Without this, a black-holed
+# host (firewall silently drops packets) or a broken resolver can make individual
+# requests hang for minutes -- the crawler then appears to "load forever" and never
+# crawls any page, even though `timeout=` is passed to requests (it does not cover
+# DNS resolution done by other libraries).
+socket.setdefaulttimeout(20)
+
 import requests
 from bs4 import BeautifulSoup, Comment, UnicodeDammit
 from requests.adapters import HTTPAdapter
@@ -87,6 +96,9 @@ try:
 except ImportError:
     WHOIS_AVAILABLE = False
 
+# Non-blocking socket for optional DNS lookups (dnspython honours this timeout).
+_DNS_TIMEOUT = 5
+
 
 # --------------------------------------------------------------------------- #
 # Constants / regexes
@@ -95,6 +107,16 @@ except ImportError:
 MAX_TEXT = 3_000_000          # max chars of a page / asset we run regexes on
 MAX_ASSET_BYTES = 2_000_000
 MAX_IMAGE_BYTES = 5_000_000
+
+# Network timeouts. A *connect* timeout must be short: if the target host silently
+# drops packets (firewall black-hole, dead CDN node), an unbounded connect makes the
+# whole crawl hang "loading forever" without ever fetching a page. The read timeout
+# stays generous so slow pages still get served.
+CONNECT_TIMEOUT = 8
+READ_TIMEOUT = 20
+# Give up on a crawl after this many consecutive failed requests (timeouts, refused
+# connections, ...). Prevents an endless "loading..." when the site is unreachable.
+MAX_CONSECUTIVE_FAILURES = 15
 
 # Local part / domain lengths are bounded to avoid quadratic regex backtracking on long tokens.
 EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,253}\.[A-Za-z]{2,24}")
@@ -687,10 +709,11 @@ def document_text(content: bytes, url: str, ctype: str) -> str:
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(DEFAULT_HEADERS)
-    retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504],
-                  allowed_methods=["GET", "HEAD"], respect_retry_after_header=True)
-    s.mount("http://", HTTPAdapter(max_retries=retry))
-    s.mount("https://", HTTPAdapter(max_retries=retry))
+    retry = Retry(total=1, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504],
+                  allowed_methods=["GET", "HEAD"], respect_retry_after_header=False)
+    # pool_connections small; keep-alive lets a session reuse connections to the same host
+    s.mount("http://", HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8))
+    s.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8))
     return s
 
 
@@ -836,10 +859,11 @@ class Ctx:
         if check_robots and self.o["respect_robots"] and not self.robots.allowed(url):
             self.log(f"[robots] blocked {url}")
             return None
+        kw.setdefault("timeout", (CONNECT_TIMEOUT, READ_TIMEOUT))
         try:
-            return self.session.get(url, timeout=15, **kw)
+            return self.session.get(url, allow_redirects=True, **kw)
         except requests.RequestException as e:
-            self.log(f"[err] {url} -- {e}")
+            self.log(f"[err] {url} -- {e.__class__.__name__}: {e}")
             return None
 
     def fetch_asset(self, url: str, kind: str):
@@ -1045,6 +1069,13 @@ def read_sitemaps(base: str, ctx: Ctx, max_files: int = 10, max_urls: int = 3000
 
 def dns_whois_emails(domain: str, ctx: Ctx):
     if DNS_AVAILABLE:
+        # Bound resolver time: a broken / firewalled DNS setup must never hang the crawl.
+        try:
+            dns.resolver.default_resolver = dns.resolver.Resolver(configure=True)
+            dns.resolver.default_resolver.lifetime = _DNS_TIMEOUT
+            dns.resolver.default_resolver.timeout = _DNS_TIMEOUT
+        except Exception:
+            pass
         try:
             for r in dns.resolver.resolve("_dmarc." + domain, "TXT"):
                 txt = b"".join(r.strings).decode("utf-8", "ignore")
@@ -1165,6 +1196,7 @@ def crawl(start_domain: str, opts: dict | None = None, progress_callback=None, l
 
     cached_first = {norm_url(start): first_resp}
     attempts = 0
+    consecutive_failures = 0
     max_attempts = o["max_pages"] * 3 + len(SEED_PATHS) + 20
     while (q_pri or q_norm) and attempts < max_attempts:
         url = q_pri.popleft() if q_pri else q_norm.popleft()
@@ -1230,6 +1262,16 @@ def crawl(start_domain: str, opts: dict | None = None, progress_callback=None, l
         if progress_callback:
             progress_callback(counters["pages"] + counters["docs"], o["max_pages"] + o["max_docs"], url,
                               skipped=skipped, error=err)
+
+        # If the site keeps failing (timeouts / connection errors), stop instead of
+        # grinding through thousands of doomed requests -- otherwise the UI looks like
+        # it is "loading forever" and never finishes.
+        consecutive_failures = 0 if not skipped else consecutive_failures + 1
+        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            ctx.log(f"[warn] {consecutive_failures} consecutive failed requests -- stopping early "
+                    f"(the site seems unreachable or is blocking us)")
+            break
+
         time.sleep(delay)
 
     if renderer:
