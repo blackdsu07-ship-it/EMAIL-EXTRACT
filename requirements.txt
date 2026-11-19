@@ -3,3 +3,7 @@ requests
 beautifulsoup4
 pillow
 pytesseract
+pypdf
+dnspython
+python-whois
+# optional, local only (JS rendering):  pip install playwright && playwright install chromium
