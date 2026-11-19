@@ -780,8 +780,9 @@ class Renderer:
 
 
 class Ctx:
-    def __init__(self, domain: str, opts: dict, log=None, on_found=None):
+    def __init__(self, domain: str, opts: dict, log=None, on_found=None, on_removed=None):
         self.on_found = on_found
+        self.on_removed = on_removed
         self.domain = domain
         self.o = opts
         self.scope = {domain}
@@ -803,8 +804,24 @@ class Ctx:
         return False
 
     # results ---------------------------------------------------------------
+    def email_in_scope(self, email: str) -> bool:
+        return self.in_scope("http://" + email.split("@")[1])
+
     def add(self, emails, method: str, url: str):
         for e in emails:
+            r = rot13(e)
+            if e not in self.results and r != e:
+                # the ROT13-encoded form of an address we already have is junk, never report it
+                if r in self.results and self.email_in_scope(r) and not self.email_in_scope(e):
+                    continue
+                # an in-scope address arrived after its encoded junk form was reported: retract the junk
+                if r in self.results and self.email_in_scope(e) and not self.email_in_scope(r):
+                    del self.results[r]
+                    if self.on_removed:
+                        try:
+                            self.on_removed(r)
+                        except Exception:
+                            pass
             is_new = e not in self.results
             rec = self.results.setdefault(e, {"methods": set(), "url": url})
             rec["methods"].add(method)
@@ -1087,10 +1104,11 @@ def process_html(html_text: str, url: str, ctx: Ctx):
     return found, links
 
 
-def crawl(start_domain: str, opts: dict | None = None, progress_callback=None, log=None, on_found=None):
+def crawl(start_domain: str, opts: dict | None = None, progress_callback=None, log=None,
+          on_found=None, on_removed=None):
     o = {**DEFAULT_OPTS, **(opts or {})}
     domain = normalize_domain(start_domain)
-    ctx = Ctx(domain, o, log=log, on_found=on_found)
+    ctx = Ctx(domain, o, log=log, on_found=on_found, on_removed=on_removed)
     for extra in o.get("extra_domains") or ():
         ctx.scope.add(normalize_domain(extra))
 
@@ -1239,9 +1257,10 @@ def drop_rot13_lookalikes(ctx: Ctx):
     """If rot13(x) is an in-scope address we found, the raw string x was only the encoded form."""
     for e in list(ctx.results):
         r = rot13(e)
-        if r != e and r in ctx.results and ctx.in_scope("http://" + r.split("@")[1]) \
-                and not ctx.in_scope("http://" + e.split("@")[1]):
+        if r != e and r in ctx.results and ctx.email_in_scope(r) and not ctx.email_in_scope(e):
             del ctx.results[e]
+            if ctx.on_removed:
+                ctx.on_removed(e)
 
 
 def split_results(results: dict, domain: str, extra_domains=()):
@@ -1332,6 +1351,11 @@ def run_ui():
         live_rows: list = []          # newest first
         live_other = {"n": 0}
 
+        def on_removed(email):
+            live_other["n"] = max(0, live_other["n"] - 1)
+            live_header.markdown(f"**Found so far: {len(live_rows)}**"
+                                 + (f" · {live_other['n']} from other domains" if live_other["n"] else ""))
+
         def on_found(email, method, url):
             d = email.split("@")[1]
             if any(d == sc or d.endswith("." + sc) for sc in scope_now):
@@ -1352,7 +1376,7 @@ def run_ui():
         )
 
         with st.spinner("Crawling..."):
-            results, visited, _ctx = crawl(domain_input, opts, progress_callback, push_log, on_found)
+            results, visited, _ctx = crawl(domain_input, opts, progress_callback, push_log, on_found, on_removed)
 
         progress_bar.progress(1.0)
         status_box.text(f"Done. Crawled {len(visited)} item(s).")
