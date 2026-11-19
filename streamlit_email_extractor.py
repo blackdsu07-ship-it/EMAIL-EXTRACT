@@ -780,7 +780,8 @@ class Renderer:
 
 
 class Ctx:
-    def __init__(self, domain: str, opts: dict, log=None):
+    def __init__(self, domain: str, opts: dict, log=None, on_found=None):
+        self.on_found = on_found
         self.domain = domain
         self.o = opts
         self.scope = {domain}
@@ -804,8 +805,14 @@ class Ctx:
     # results ---------------------------------------------------------------
     def add(self, emails, method: str, url: str):
         for e in emails:
+            is_new = e not in self.results
             rec = self.results.setdefault(e, {"methods": set(), "url": url})
             rec["methods"].add(method)
+            if is_new and self.on_found:
+                try:
+                    self.on_found(e, method, url)
+                except Exception:
+                    pass
 
     # network ---------------------------------------------------------------
     def get(self, url: str, check_robots: bool = True, **kw):
@@ -1080,10 +1087,10 @@ def process_html(html_text: str, url: str, ctx: Ctx):
     return found, links
 
 
-def crawl(start_domain: str, opts: dict | None = None, progress_callback=None, log=None):
+def crawl(start_domain: str, opts: dict | None = None, progress_callback=None, log=None, on_found=None):
     o = {**DEFAULT_OPTS, **(opts or {})}
     domain = normalize_domain(start_domain)
-    ctx = Ctx(domain, o, log=log)
+    ctx = Ctx(domain, o, log=log, on_found=on_found)
     for extra in o.get("extra_domains") or ():
         ctx.scope.add(normalize_domain(extra))
 
@@ -1319,6 +1326,22 @@ def run_ui():
             push_log(f"{'[skip]' if skipped else '[ok]  '} {url}{' -- ' + error if error else ''}")
 
         extra_domains = [d.strip() for d in extra_domains_txt.split(",") if d.strip()]
+        scope_now = {normalize_domain(domain_input)} | {normalize_domain(d) for d in extra_domains}
+        live_header = st.empty()
+        live_box = st.empty()
+        live_rows: list = []          # newest first
+        live_other = {"n": 0}
+
+        def on_found(email, method, url):
+            d = email.split("@")[1]
+            if any(d == sc or d.endswith("." + sc) for sc in scope_now):
+                live_rows.insert(0, f"{email}    ({method})")
+                live_header.markdown(f"**Found so far: {len(live_rows)}**"
+                                     + (f" · {live_other['n']} from other domains" if live_other["n"] else ""))
+                live_box.code("\n".join(live_rows), language=None)
+            else:
+                live_other["n"] += 1
+                live_header.markdown(f"**Found so far: {len(live_rows)}** · {live_other['n']} from other domains")
         opts = dict(
             max_pages=int(max_pages), delay=float(delay), include_subdomains=include_subdomains,
             respect_robots=respect_robots, use_sitemap=use_sitemap, seed_paths=seed_paths,
@@ -1329,10 +1352,12 @@ def run_ui():
         )
 
         with st.spinner("Crawling..."):
-            results, visited, _ctx = crawl(domain_input, opts, progress_callback, push_log)
+            results, visited, _ctx = crawl(domain_input, opts, progress_callback, push_log, on_found)
 
         progress_bar.progress(1.0)
         status_box.text(f"Done. Crawled {len(visited)} item(s).")
+        live_header.empty()
+        live_box.empty()
 
         clean_domain = normalize_domain(domain_input)
         own, other = split_results(results, clean_domain, extra_domains)
